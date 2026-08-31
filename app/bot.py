@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app import claude_client, config, db, planning, render
-from app.integrations import calendar, gmail, ticktick
+from app.integrations import calendar, gmail, tasks, ticktick
 
 bot = Bot(token=config.TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -64,10 +64,15 @@ async def cmd_setup(message: Message):
         lines.append(f"Gmail ({state}):")
         lines.append(f"{config.PUBLIC_URL}/auth/google?key={config.SETUP_KEY}")
         lines.append("")
-    if config.TICKTICK_ENABLED:
+    mode = tasks.mode()
+    if mode == "mcp":
+        lines.append("TickTick: подключён по токену, ссылка не нужна.")
+    elif mode == "oauth":
         state = "готово" if ticktick.connected() else "нужно подключить"
         lines.append(f"TickTick ({state}):")
         lines.append(f"{config.PUBLIC_URL}/auth/ticktick?key={config.SETUP_KEY}")
+    else:
+        lines.append("TickTick: не настроен (нет TICKTICK_TOKEN).")
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -110,7 +115,7 @@ async def cmd_diag(message: Message):
     checks = []
     gm_ok, gm = await gmail.check()
     checks.append(("почта", gm_ok, gm))
-    tt_ok, tt = await ticktick.check()
+    tt_ok, tt = await tasks.check()
     checks.append(("задачи", tt_ok, tt))
     cal_ok, cal = await calendar.check()
     checks.append(("календарь", cal_ok, cal))
@@ -126,6 +131,30 @@ async def cmd_diag(message: Message):
     except Exception:
         checks.append(("диск", False, "ошибка"))
     await message.answer(mono(render.diagnostics(checks)), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(message: Message):
+    """Показывает, что бот видит в TickTick, и какие инструменты нашёл."""
+    if not mine(message):
+        return
+    mode = tasks.mode()
+    if mode == "off":
+        return await message.answer("TickTick не подключён.")
+    lines = [f"режим: {mode}"]
+    if mode == "mcp":
+        from app.integrations import ticktick_mcp
+        try:
+            found = await ticktick_mcp.tool_list(force=True)
+            lines.append(f"инструментов: {len(found)}")
+            lines += ["· " + (t.get("name") or "?") for t in found[:25]]
+        except Exception as exc:
+            lines.append(f"ошибка списка: {exc}")
+    open_items = await tasks.open_tasks()
+    lines.append("")
+    lines.append(f"открытых задач: {len(open_items)}")
+    lines += ["□ " + i["title"][:30] for i in open_items[:10]]
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("brief"))

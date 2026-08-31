@@ -3,7 +3,7 @@ import asyncio
 from datetime import date
 
 from app import claude_client, db, render
-from app.integrations import calendar, gmail, news, ticktick
+from app.integrations import calendar, gmail, news, tasks
 
 MAIL_SYSTEM = """Ты разбираешь почту. Для каждого письма дай ОДНУ строку не длиннее
 40 символов в формате «Отправитель — суть». Пометь important=true, если письмо
@@ -56,7 +56,7 @@ async def gather() -> dict:
     mail_t = asyncio.create_task(_safe(gmail.recent() if gmail.connected() else _none()))
     news_t = asyncio.create_task(_safe(news.headlines()))
     tasks_t = asyncio.create_task(
-        _safe(ticktick.open_tasks() if ticktick.connected() else _none())
+        _safe(tasks.open_tasks() if tasks.connected() else _none())
     )
 
     weather = await weather_t

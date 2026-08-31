@@ -2,7 +2,7 @@
 from datetime import date, datetime, timedelta
 
 from app import brief, claude_client, db, render
-from app.integrations import ticktick
+from app.integrations import tasks
 
 MODE_KEY = "mode"
 
@@ -97,8 +97,8 @@ async def handle_plan_reply(text: str) -> str:
             continue
         item = {"kind": "task", "title": str(t["title"])[:40],
                 "note": str(t.get("note", ""))[:10]}
-        if ticktick.connected():
-            created = await ticktick.create(item["title"])
+        if tasks.connected():
+            created = await tasks.create(item["title"])
             if created.get("id"):
                 item["ticktick_id"] = created["id"]
                 item["ticktick_project"] = created.get("project_id", "")
@@ -149,7 +149,7 @@ async def handle_debrief_reply(text: str) -> tuple[str, str | None]:
         db.set_item_status(item["id"], status, str(row.get("note", ""))[:10])
         item["status"], item["note"] = status, str(row.get("note", ""))[:10]
         if status == "done" and item.get("ticktick_id"):
-            if await ticktick.complete(item["ticktick_project"], item["ticktick_id"]):
+            if await tasks.complete(item["ticktick_project"], item["ticktick_id"]):
                 closed += 1
 
     done, total = db.day_score(today_key())
