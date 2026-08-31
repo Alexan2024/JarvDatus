@@ -1,5 +1,4 @@
-"""Телеграм-бот: команды, чат с Claude, живая печать ответа."""
-import asyncio
+"""Телеграм-бот: свободная речь, кнопки, команды — три входа к одним действиям."""
 import html
 import time
 from datetime import date, datetime
@@ -7,7 +6,7 @@ from datetime import date, datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from app import claude_client, config, db, planning, render
 from app.integrations import calendar, gmail, tasks, ticktick
@@ -15,6 +14,19 @@ from app.integrations import calendar, gmail, tasks, ticktick
 bot = Bot(token=config.TELEGRAM_TOKEN)
 dp = Dispatcher()
 STARTED_AT = time.time()
+
+BTN_BRIEF, BTN_PLAN = "Сводка", "План"
+BTN_DEBRIEF, BTN_STATUS = "Итоги", "Статус"
+
+KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_BRIEF), KeyboardButton(text=BTN_PLAN)],
+        [KeyboardButton(text=BTN_DEBRIEF), KeyboardButton(text=BTN_STATUS)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Пишите как есть — разберу",
+)
 
 
 def mono(text: str) -> str:
@@ -30,23 +42,175 @@ async def send_text(text: str) -> None:
                            parse_mode=ParseMode.HTML)
 
 
+async def reply_block(message: Message, text: str) -> None:
+    await message.answer(mono(text), parse_mode=ParseMode.HTML)
+
+
 def mine(message: Message) -> bool:
     return config.OWNER_ID and message.from_user.id == config.OWNER_ID
 
+
+# ======================= действия =======================
+# Каждое действие вызывается из трёх мест: команда, кнопка, свободная речь.
+
+async def act_brief(message: Message) -> None:
+    await message.answer("Собираю…")
+    text, _ = await planning.build_morning()
+    await reply_block(message, text)
+
+
+async def act_plan_day(message: Message) -> None:
+    _, question = await planning.build_morning()
+    planning.set_mode("await_plan")
+    await reply_block(message, question)
+
+
+async def act_show_plan(message: Message) -> None:
+    items = db.get_plan(planning.today_key())
+    if not items:
+        return await message.answer(
+            "План на сегодня ещё не составлен. Скажите «давай спланируем день»."
+        )
+    await reply_block(message, render.plan(date.today(), items, False))
+
+
+async def act_debrief(message: Message) -> None:
+    text = await planning.build_evening()
+    if not text:
+        return await message.answer("На сегодня открытых задач нет, сэр.")
+    await reply_block(message, text)
+
+
+async def act_status(message: Message) -> None:
+    now = datetime.now(config.TZ)
+    plan_items = db.get_plan(date.today().isoformat())
+    active = sum(1 for i in plan_items if i["kind"] != "event" and i["status"] == "open")
+
+    unread = await gmail.unread_count() if gmail.connected() else 0
+    events = await calendar.today()
+    next_ev = next((e for e in events if e["start"] > now), None)
+    if next_ev:
+        mins = int((next_ev["start"] - now).total_seconds() // 60)
+        next_line = f"{mins} мин" if mins < 600 else next_ev["time"]
+    else:
+        next_line = "нет"
+
+    spent = db.kv_get("spent_today", {"usd": 0})
+    up = int(time.time() - STARTED_AT)
+    uptime = f"{up // 86400}д {up % 86400 // 3600}ч" if up >= 86400 else \
+             f"{up // 3600}ч {up % 3600 // 60}м"
+
+    await reply_block(message, render.status([
+        ("время", now.strftime("%H:%M")),
+        ("почта", f"{unread} непроч." if unread else "чисто"),
+        ("задачи", f"{active} активных"),
+        ("до встречи", next_line),
+        ("расход API", f"${spent.get('usd', 0):.2f}"),
+        ("аптайм", uptime),
+    ]))
+
+
+async def act_diagnostics(message: Message) -> None:
+    checks = []
+    gm_ok, gm = await gmail.check()
+    checks.append(("почта", gm_ok, gm))
+    tt_ok, tt = await tasks.check()
+    checks.append(("задачи", tt_ok, tt))
+    cal_ok, cal = await calendar.check()
+    checks.append(("календарь", cal_ok, cal))
+    try:
+        await claude_client.ask("Ответь одним словом: работает",
+                                system="Отвечай одним словом.", max_tokens=10)
+        checks.append(("Claude", True, "ок"))
+    except Exception:
+        checks.append(("Claude", False, "ошибка"))
+    try:
+        db.kv_set("_diag", time.time())
+        checks.append(("диск", True, "ок"))
+    except Exception:
+        checks.append(("диск", False, "ошибка"))
+    await reply_block(message, render.diagnostics(checks))
+
+
+async def act_add_task(message: Message, title: str = "") -> None:
+    title = (title or "").strip()[:40]
+    if not title:
+        return await message.answer("Что записать, сэр?")
+    created = {}
+    if tasks.connected():
+        created = await tasks.create(title)
+    day = planning.today_key()
+    items = db.get_plan(day)
+    items.append({
+        "kind": "task", "title": title, "note": "", "status": "open",
+        "ticktick_id": created.get("id", ""),
+        "ticktick_project": created.get("project_id", ""),
+    })
+    db.save_plan(day, items)
+    mark = "✓ записано в TickTick" if created.get("id") else "✓ записано"
+    await reply_block(message, render.note(f"{mark}: {render.cut(title, 20)}"))
+
+
+async def act_list_tasks(message: Message) -> None:
+    if not tasks.connected():
+        return await message.answer("Задачи не подключены.")
+    items = await tasks.open_tasks()
+    if not items:
+        return await message.answer("Открытых задач нет, сэр.")
+    body = [render.cut(f"□ {i['title']}", render.W - 2) for i in items[:12]]
+    await reply_block(message, render.box("ЗАДАЧИ", [body]))
+
+
+async def act_remember(message: Message, fact: str = "") -> None:
+    fact = (fact or "").strip()
+    if not fact:
+        return await message.answer("Что запомнить, сэр?")
+    db.add_fact(fact)
+    await message.answer("Запомнил.")
+
+
+ACTIONS = {
+    "show_brief": lambda m, a: act_brief(m),
+    "plan_day": lambda m, a: act_plan_day(m),
+    "show_plan": lambda m, a: act_show_plan(m),
+    "start_debrief": lambda m, a: act_debrief(m),
+    "show_status": lambda m, a: act_status(m),
+    "run_diagnostics": lambda m, a: act_diagnostics(m),
+    "add_task": lambda m, a: act_add_task(m, a.get("title", "")),
+    "list_tasks": lambda m, a: act_list_tasks(m),
+    "remember_fact": lambda m, a: act_remember(m, a.get("fact", "")),
+}
+
+BUTTONS = {
+    BTN_BRIEF: act_brief,
+    BTN_PLAN: act_plan_day,
+    BTN_DEBRIEF: act_debrief,
+    BTN_STATUS: act_status,
+}
+
+
+# ======================= команды =======================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not mine(message):
         return await message.answer("Этот бот приватный.")
-    await message.answer(mono(render.box("АССИСТЕНТ ЗАПУЩЕН", [[
-        "/status  — сводка систем",
-        "/brief   — бриф сейчас",
-        "/plan    — спланировать день",
-        "/debrief — разбор дня",
-        "/setup   — подключить сервисы",
-        "/tone    — сменить тон",
-        "/reset   — очистить диалог",
-    ]])), parse_mode=ParseMode.HTML)
+    await message.answer(mono(render.box("АССИСТЕНТ ЗАПУЩЕН", [
+        [
+            "Говорите обычными словами:",
+            "«что сегодня»",
+            "«давай спланируем день»",
+            "«добавь задачу купить хлеб»",
+            "«подведём итоги»",
+            "«найди новости про X»",
+        ],
+        [
+            "Команды, если удобнее:",
+            "/brief /plan /debrief",
+            "/status /tasks /setup",
+            "/tone /remember /reset",
+        ],
+    ])), parse_mode=ParseMode.HTML, reply_markup=KEYBOARD)
 
 
 @dp.message(Command("setup"))
@@ -76,63 +240,6 @@ async def cmd_setup(message: Message):
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
-    if not mine(message):
-        return
-    now = datetime.now(config.TZ)
-    plan_items = db.get_plan(date.today().isoformat())
-    active = sum(1 for i in plan_items if i["kind"] != "event" and i["status"] == "open")
-
-    unread = await gmail.unread_count() if gmail.connected() else 0
-    events = await calendar.today()
-    next_ev = next((e for e in events if e["start"] > now), None)
-    if next_ev:
-        mins = int((next_ev["start"] - now).total_seconds() // 60)
-        next_line = f"{mins} мин" if mins < 600 else next_ev["time"]
-    else:
-        next_line = "нет"
-
-    spent = db.kv_get("spent_today", {"usd": 0})
-    up = int(time.time() - STARTED_AT)
-    uptime = f"{up // 86400}д {up % 86400 // 3600}ч" if up >= 86400 else \
-             f"{up // 3600}ч {up % 3600 // 60}м"
-
-    await message.answer(mono(render.status([
-        ("время", now.strftime("%H:%M")),
-        ("почта", f"{unread} непроч." if unread else "чисто"),
-        ("задачи", f"{active} активных"),
-        ("до встречи", next_line),
-        ("расход API", f"${spent.get('usd', 0):.2f}"),
-        ("аптайм", uptime),
-    ])), parse_mode=ParseMode.HTML)
-
-
-@dp.message(Command("diagnostics"))
-async def cmd_diag(message: Message):
-    if not mine(message):
-        return
-    checks = []
-    gm_ok, gm = await gmail.check()
-    checks.append(("почта", gm_ok, gm))
-    tt_ok, tt = await tasks.check()
-    checks.append(("задачи", tt_ok, tt))
-    cal_ok, cal = await calendar.check()
-    checks.append(("календарь", cal_ok, cal))
-    try:
-        await claude_client.ask("Ответь одним словом: работает",
-                                system="Отвечай одним словом.", max_tokens=10)
-        checks.append(("Claude", True, "ок"))
-    except Exception:
-        checks.append(("Claude", False, "ошибка"))
-    try:
-        db.kv_set("_diag", time.time())
-        checks.append(("диск", True, "ок"))
-    except Exception:
-        checks.append(("диск", False, "ошибка"))
-    await message.answer(mono(render.diagnostics(checks)), parse_mode=ParseMode.HTML)
-
-
 @dp.message(Command("tasks"))
 async def cmd_tasks(message: Message):
     """Показывает, что бот видит в TickTick, и какие инструменты нашёл."""
@@ -147,7 +254,19 @@ async def cmd_tasks(message: Message):
         try:
             found = await ticktick_mcp.tool_list(force=True)
             lines.append(f"инструментов: {len(found)}")
-            lines += ["· " + (t.get("name") or "?") for t in found[:25]]
+            chosen = {
+                "проекты": ticktick_mcp._projects_tool(found),
+                "задачи": ticktick_mcp._tasks_tool(found),
+                "создать": ticktick_mcp._pick(found, ["task"], ["create", "add", "new"]),
+                "закрыть": ticktick_mcp._pick(
+                    found, ["task"], ["complete", "finish", "done"],
+                    avoid=["undone", "uncompleted", "incomplete", "get", "list"]),
+            }
+            for role, tool in chosen.items():
+                lines.append(f"  {role}: {(tool or {}).get('name', '— не найден')}")
+            projects = await ticktick_mcp.projects(force=True)
+            lines.append(f"списков: {len(projects)}")
+            lines += ["  · " + p["name"] for p in projects[:10]]
         except Exception as exc:
             lines.append(f"ошибка списка: {exc}")
     open_items = await tasks.open_tasks()
@@ -159,35 +278,35 @@ async def cmd_tasks(message: Message):
 
 @dp.message(Command("brief"))
 async def cmd_brief(message: Message):
-    if not mine(message):
-        return
-    await message.answer("Собираю…")
-    text, _ = await planning.build_morning()
-    await message.answer(mono(text), parse_mode=ParseMode.HTML)
+    if mine(message):
+        await act_brief(message)
 
 
 @dp.message(Command("plan"))
 async def cmd_plan(message: Message):
     if not mine(message):
         return
-    today = db.get_plan(planning.today_key())
-    if today and not message.text.endswith("new"):
-        return await message.answer(
-            mono(render.plan(date.today(), today, False)), parse_mode=ParseMode.HTML
-        )
-    _, question = await planning.build_morning()
-    planning.set_mode("await_plan")
-    await message.answer(mono(question), parse_mode=ParseMode.HTML)
+    if db.get_plan(planning.today_key()) and not message.text.endswith("new"):
+        return await act_show_plan(message)
+    await act_plan_day(message)
 
 
 @dp.message(Command("debrief"))
 async def cmd_debrief(message: Message):
-    if not mine(message):
-        return
-    text = await planning.build_evening()
-    if not text:
-        return await message.answer("На сегодня открытых задач нет, сэр.")
-    await message.answer(mono(text), parse_mode=ParseMode.HTML)
+    if mine(message):
+        await act_debrief(message)
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    if mine(message):
+        await act_status(message)
+
+
+@dp.message(Command("diagnostics"))
+async def cmd_diag(message: Message):
+    if mine(message):
+        await act_diagnostics(message)
 
 
 @dp.message(Command("tone"))
@@ -207,7 +326,7 @@ async def cmd_reset(message: Message):
         return
     db.clear_history()
     planning.set_mode("chat")
-    await message.answer("История очищена.")
+    await message.answer("История очищена.", reply_markup=KEYBOARD)
 
 
 @dp.message(Command("remember"))
@@ -221,8 +340,7 @@ async def cmd_remember(message: Message):
             "Помню:\n" + "\n".join(f"— {f}" for f in known) if known
             else "Пока ничего не записано. Напишите: /remember текст"
         )
-    db.add_fact(fact)
-    await message.answer("Запомнил.")
+    await act_remember(message, fact)
 
 
 @dp.message(Command("forget"))
@@ -233,39 +351,49 @@ async def cmd_forget(message: Message):
     await message.answer("Забыл всё, что помнил о вас.")
 
 
+# ======================= свободная речь =======================
+
 @dp.message(F.text)
 async def on_text(message: Message):
     if not mine(message):
         return
     text = message.text.strip()
-    mode = planning.get_mode()
 
+    # 1. Кнопки — прямое попадание, без обращения к модели
+    if text in BUTTONS:
+        return await BUTTONS[text](message)
+
+    # 2. Диалоги плана и разбора — бот ждёт конкретный ответ
+    mode = planning.get_mode()
     if mode == "await_plan":
         await message.answer("Составляю…")
-        result = await planning.handle_plan_reply(text)
-        return await message.answer(mono(result), parse_mode=ParseMode.HTML)
+        return await reply_block(message, await planning.handle_plan_reply(text))
 
     if mode == "await_debrief":
         await message.answer("Сверяю…")
         result, question = await planning.handle_debrief_reply(text)
-        await message.answer(mono(result), parse_mode=ParseMode.HTML)
+        await reply_block(message, result)
         if question:
-            await message.answer(mono(question), parse_mode=ParseMode.HTML)
+            await reply_block(message, question)
         return
 
     if mode == "await_carry":
-        result = await planning.handle_carry_reply(text)
-        return await message.answer(mono(result), parse_mode=ParseMode.HTML)
+        return await reply_block(message, await planning.handle_carry_reply(text))
 
+    # 3. Обычная речь: Claude отвечает сам либо запускает действие
     await chat(message, text)
 
 
 async def chat(message: Message, text: str) -> None:
-    """Живая печать: бот редактирует своё сообщение по мере генерации."""
+    """Живая печать ответа; если Claude решил вызвать действие — выполняем его."""
     placeholder = await message.answer("…")
-    last_edit, last_text, partial = 0.0, "", ""
+    last_edit, last_text, partial, actions = 0.0, "", "", []
     try:
-        async for partial in claude_client.stream_reply(text):
+        async for kind, payload in claude_client.stream_reply(text):
+            if kind == "actions":
+                actions = payload
+                continue
+            partial = payload
             now = time.time()
             if now - last_edit < 1.4 or partial == last_text:
                 continue
@@ -275,11 +403,35 @@ async def chat(message: Message, text: str) -> None:
                                             parse_mode=ParseMode.HTML)
             except Exception:
                 pass
-        if last_text != partial:
+    except Exception as exc:
+        return await placeholder.edit_text(f"Сбой при обращении к Claude: {exc}")
+
+    if actions:
+        # Действие само покажет результат — заглушка не нужна
+        try:
+            if partial.strip():
+                await placeholder.edit_text(html.escape(partial),
+                                            parse_mode=ParseMode.HTML)
+            else:
+                await placeholder.delete()
+        except Exception:
+            pass
+        for action in actions:
+            handler = ACTIONS.get(action["name"])
+            if not handler:
+                continue
+            try:
+                await handler(message, action.get("input", {}))
+            except Exception as exc:
+                await message.answer(f"Не удалось выполнить: {exc}")
+        return
+
+    if last_text != partial:
+        try:
             await placeholder.edit_text(html.escape(partial or "(пусто)"),
                                         parse_mode=ParseMode.HTML)
-    except Exception as exc:
-        await placeholder.edit_text(f"Сбой при обращении к Claude: {exc}")
+        except Exception:
+            pass
 
 
 async def run() -> None:

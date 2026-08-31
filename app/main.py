@@ -33,7 +33,10 @@ async def amain() -> None:
              config.MORNING_H, config.MORNING_M,
              config.EVENING_H, config.EVENING_M, config.TZ_NAME)
     try:
-        await bot_module.send_text("Ассистент на связи, сэр.")
+        await bot_module.bot.send_message(
+            config.OWNER_ID, "Ассистент на связи, сэр.",
+            reply_markup=bot_module.KEYBOARD,
+        )
     except Exception:
         log.warning("не смог отправить приветствие — проверьте OWNER_ID")
     await bot_module.run()

@@ -11,6 +11,110 @@ client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
 
+# Действия бота, которые Claude может запустить сам, поняв просьбу своими словами.
+ACTION_TOOLS = [
+    {
+        "name": "show_brief",
+        "description": (
+            "Показать сводку дня: погода, календарь, почта, новости, "
+            "незакрытые задачи. Вызывай, когда просят сводку, бриф, "
+            "«что сегодня», «что нового», «как день выглядит»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "plan_day",
+        "description": (
+            "Начать составление плана на день: бот спросит, что человек "
+            "собирается делать. Вызывай на «давай спланируем день», "
+            "«составь план», «надо распланировать»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "show_plan",
+        "description": (
+            "Показать уже составленный план на сегодня. Вызывай на "
+            "«что у меня в плане», «покажи список дел», «что мне сегодня делать»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "start_debrief",
+        "description": (
+            "Начать вечерний разбор дня: бот покажет утренний список и спросит, "
+            "что закрыто. Вызывай на «подведём итоги», «давай разберём день», "
+            "«отчитаюсь за день»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "add_task",
+        "description": (
+            "Создать задачу в TickTick и добавить её в план на сегодня. "
+            "Вызывай на «добавь задачу…», «запиши в дела…», «напомни сделать…». "
+            "НЕ вызывай, если человек рассказывает о планах на весь день — "
+            "для этого есть plan_day."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Короткая формулировка задачи, глагол в инфинитиве",
+                }
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "name": "list_tasks",
+        "description": (
+            "Показать незакрытые задачи из TickTick. Вызывай на "
+            "«что у меня в задачах», «покажи тикток», «что висит»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "show_status",
+        "description": (
+            "Сводка систем: время, непрочитанная почта, активные задачи, "
+            "ближайшая встреча, расход API. Вызывай на «статус», «как дела у тебя», "
+            "«сколько я потратил», «когда следующая встреча»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "run_diagnostics",
+        "description": (
+            "Проверить подключения: почта, задачи, календарь, Claude, диск. "
+            "Вызывай на «всё ли работает», «проверь подключения», «диагностика»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "remember_fact",
+        "description": (
+            "Запомнить факт о владельце навсегда. Вызывай на «запомни, что…», "
+            "«имей в виду, что…». Факты потом подмешиваются в каждый разговор."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fact": {"type": "string", "description": "Факт одной фразой"}
+            },
+            "required": ["fact"],
+        },
+    },
+]
+
+ROUTING_RULES = """
+У тебя есть инструменты-действия (show_brief, plan_day, add_task и другие).
+Когда просьба человека соответствует действию — вызывай инструмент и НЕ пиши
+ничего лишнего: бот сам покажет результат в своём оформлении.
+Если человек просто спрашивает или беседует — отвечай текстом, инструменты
+действий не трогай. Для фактических вопросов о мире пользуйся поиском."""
+
 PERSONA = """Ты — личный ассистент. Отвечаешь по-русски.
 
 Характер: сдержанный, суховато-ироничный, в духе британского дворецкого.
@@ -33,6 +137,7 @@ def system_prompt() -> str:
     if known:
         base += "\n\nЧто ты знаешь о владельце:\n" + "\n".join(f"- {f}" for f in known)
     base += f"\n\nСегодня {date.today().isoformat()}, таймзона {config.TZ_NAME}."
+    base += "\n" + ROUTING_RULES
     return base
 
 
@@ -52,23 +157,35 @@ def _track(usage) -> None:
 
 
 async def stream_reply(user_text: str):
-    """Отдаёт куски текста по мере генерации. Поиск в интернете включён."""
+    """Отдаёт ("text", кусок) по мере генерации и ("actions", список) в конце."""
     messages = db.history(20) + [{"role": "user", "content": user_text}]
     text = ""
+    actions: list[dict] = []
     async with client.messages.stream(
         model=config.MODEL,
         max_tokens=2000,
         system=system_prompt(),
         messages=messages,
-        tools=[WEB_SEARCH_TOOL],
+        tools=[WEB_SEARCH_TOOL] + ACTION_TOOLS,
     ) as stream:
         async for chunk in stream.text_stream:
             text += chunk
-            yield text
+            yield "text", text
         final = await stream.get_final_message()
         _track(final.usage)
+        known = {t["name"] for t in ACTION_TOOLS}
+        for block in final.content:
+            if getattr(block, "type", "") == "tool_use" and block.name in known:
+                actions.append({"name": block.name,
+                                "input": dict(block.input or {})})
+
     db.add_message("user", user_text)
-    db.add_message("assistant", text or "(пусто)")
+    if actions:
+        names = ", ".join(a["name"] for a in actions)
+        db.add_message("assistant", text or f"(выполнено действие: {names})")
+    else:
+        db.add_message("assistant", text or "(пусто)")
+    yield "actions", actions
 
 
 async def ask(prompt: str, system: str | None = None, search: bool = False,

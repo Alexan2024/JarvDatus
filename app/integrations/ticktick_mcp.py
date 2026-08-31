@@ -4,6 +4,7 @@
 жёстко, а находит подходящие сам по списку tools/list.
 """
 import logging
+import re
 import time
 
 from app import config, db
@@ -50,18 +51,32 @@ def _properties(tool: dict) -> dict:
     return props if isinstance(props, dict) else {}
 
 
+def _words(name: str) -> list[str]:
+    """create_task -> [create, task]; getProjectTasks -> [get, project, tasks]."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
+    return [w for w in re.split(r"[^a-zA-Z0-9]+", spaced.lower()) if w]
+
+
+def _has_verb(name: str, verbs: list[str]) -> bool:
+    """Сравниваем по целым словам: «undone» не считается за «done»."""
+    parts = _words(name)
+    return any(word == verb or word == verb + "s" for word in parts for verb in verbs)
+
+
 def _pick(tools: list[dict], must: list[str], verbs: list[str],
           avoid: list[str] | None = None) -> dict | None:
     avoid = avoid or []
     best = None
     for tool in tools:
-        name = (tool.get("name") or "").lower()
+        raw = tool.get("name") or ""
+        name = raw.lower()
         text = name + " " + (tool.get("description") or "").lower()
-        if any(bad in name for bad in avoid):
+        parts = _words(raw)          # разбор до приведения к нижнему регистру
+        if any(bad in parts for bad in avoid):
             continue
         if not all(word in text for word in must):
             continue
-        if not any(verb in name for verb in verbs):
+        if not _has_verb(raw, verbs):
             continue
         if all(word in name for word in must):
             return tool
@@ -86,16 +101,40 @@ TASK_ID_KEYS = ["taskId", "task_id", "id"]
 
 # ---------- разбор ответов ----------
 
-def _as_items(payload) -> list[dict]:
+KNOWN_LIST_KEYS = ("undoneTasks", "undone_tasks", "tasks", "items", "data",
+                   "results", "projects", "lists", "children")
+
+
+def _as_items(payload, prefer: str = "") -> list[dict]:
+    """Достаёт список словарей из ответа любой вложенности."""
     if isinstance(payload, list):
         return [i for i in payload if isinstance(i, dict)]
-    if isinstance(payload, dict):
-        for key in ("tasks", "items", "data", "results", "projects", "lists"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [i for i in value if isinstance(i, dict)]
-        if payload.get("id") or payload.get("title"):
-            return [payload]
+    if not isinstance(payload, dict):
+        return []
+
+    if prefer:
+        for key, value in payload.items():
+            if prefer in key.lower() and isinstance(value, list):
+                found = [i for i in value if isinstance(i, dict)]
+                if found:
+                    return found
+
+    for key in KNOWN_LIST_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            found = [i for i in value if isinstance(i, dict)]
+            if found:
+                return found
+
+    # рекурсивно ищем первый подходящий список глубже
+    for value in payload.values():
+        if isinstance(value, (dict, list)):
+            found = _as_items(value, prefer)
+            if found:
+                return found
+
+    if payload.get("id") or payload.get("title") or payload.get("name"):
+        return [payload]
     return []
 
 
@@ -132,41 +171,109 @@ def _is_done(item: dict) -> bool:
 
 # ---------- публичные операции ----------
 
+def _projects_tool(tools: list[dict]) -> dict | None:
+    return _pick(tools, ["project"], ["list", "get", "query", "fetch", "all"],
+                 avoid=["create", "add", "update", "delete", "task", "member",
+                        "by_id", "byid"]) \
+        or _pick(tools, ["list"], ["get", "query", "fetch", "all"],
+                 avoid=["create", "add", "update", "delete", "task"])
+
+
+def _tasks_tool(tools: list[dict]) -> dict | None:
+    """Сначала ищем «незакрытые задачи проекта», потом любой инструмент чтения."""
+    avoid = ["create", "add", "update", "delete", "move",
+             "assign", "unassign", "member"]
+    for word in ("undone", "uncompleted", "incomplete"):
+        found = _pick(tools, [word], ["get", "list", "query", "fetch"], avoid=avoid)
+        if found:
+            return found
+    return _pick(tools, ["task"], ["get", "list", "query", "search", "fetch", "find"],
+                 avoid=avoid)
+
+
+_projects_cache: list[dict] = []
+_projects_at = 0.0
+
+
+async def projects(force: bool = False) -> list[dict]:
+    global _projects_cache, _projects_at
+    if _projects_cache and not force and time.time() - _projects_at < 900:
+        return _projects_cache
+    tools = await tool_list()
+    tool = _projects_tool(tools)
+    if not tool:
+        return []
+    items = _as_items(extract_json(await _get_client().call(tool["name"], {})),
+                      prefer="project")
+    out = []
+    for item in items:
+        pid = _id_of(item, ["id", "projectId", "listId"])
+        if pid:
+            out.append({"id": pid, "name": _title_of(item)})
+    if out:
+        _projects_cache, _projects_at = out, time.time()
+    return out
+
+
 async def open_tasks(limit: int = 15) -> list[dict]:
     if not enabled():
         return []
     try:
         tools = await tool_list()
-        tool = _pick(tools, ["task"], ["get", "list", "query", "search", "fetch", "find"],
-                     avoid=["create", "add", "update", "delete", "complete", "move"])
+        tool = _tasks_tool(tools)
         if not tool:
             log.warning("TickTick MCP: не нашёл инструмент чтения задач")
             return []
         props = _properties(tool)
-        args = {}
-        status_key = _key(props, ["status", "completed", "filter"])
-        if status_key and status_key.lower() == "status":
-            args[status_key] = "notCompleted" if "string" in str(
-                props.get(status_key, {}).get("type", "")) else 0
-        result = await _get_client().call(tool["name"], args)
-        items = _as_items(extract_json(result))
-        if not items:
-            items = await _rescue(extract_text(result))
-        out = []
-        for item in items:
-            if _is_done(item):
+        project_key = _key(props, PROJECT_KEYS)
+
+        targets: list[dict] = [{"id": "", "name": ""}]
+        if project_key:
+            found = await projects()
+            if not found:
+                log.warning("TickTick MCP: список проектов пуст")
+                return []
+            preferred = config.TICKTICK_PROJECT_NAME.strip().lower()
+            found.sort(key=lambda p: p["name"].strip().lower() != preferred)
+            targets = found[:8]
+
+        out: list[dict] = []
+        for target in targets:
+            if len(out) >= limit:
+                break
+            args = {}
+            if project_key and target["id"]:
+                args[project_key] = target["id"]
+            status_key = _key(props, ["status", "completed", "filter"])
+            if status_key and status_key.lower() == "status":
+                args[status_key] = "notCompleted" if "string" in str(
+                    props.get(status_key, {}).get("type", "")) else 0
+            try:
+                result = await _get_client().call(tool["name"], args)
+            except Exception as exc:
+                log.warning("TickTick MCP: %s(%s) -> %s", tool["name"], args, exc)
                 continue
-            title = _title_of(item)
-            if not title:
+            if result.get("isError"):
+                log.warning("TickTick MCP: %s вернул ошибку: %s",
+                            tool["name"], extract_text(result)[:200])
                 continue
-            out.append({
-                "id": _id_of(item, TASK_ID_KEYS),
-                "project_id": _id_of(item, PROJECT_KEYS),
-                "title": title,
-                "due": str(item.get("dueDate") or item.get("due_date") or ""),
-            })
+            items = _as_items(extract_json(result), prefer="task")
+            if not items:
+                items = await _rescue(extract_text(result))
+            for item in items:
+                if _is_done(item):
+                    continue
+                title = _title_of(item)
+                if not title:
+                    continue
+                out.append({
+                    "id": _id_of(item, TASK_ID_KEYS),
+                    "project_id": _id_of(item, PROJECT_KEYS) or target["id"],
+                    "title": title,
+                    "due": str(item.get("dueDate") or item.get("due_date") or ""),
+                })
         return out[:limit]
-    except (MCPError, Exception) as exc:
+    except Exception as exc:
         log.warning("TickTick MCP: чтение задач не удалось: %s", exc)
         return []
 
@@ -192,20 +299,10 @@ async def project_id_by_name(name: str) -> str:
     if cached:
         return cached
     try:
-        tools = await tool_list()
-        tool = _pick(tools, ["project"], ["get", "list", "query", "fetch", "all"],
-                     avoid=["create", "add", "update", "delete", "task"]) \
-            or _pick(tools, ["list"], ["get", "query", "fetch", "all"],
-                     avoid=["create", "add", "update", "delete", "task"])
-        if not tool:
-            return ""
-        items = _as_items(extract_json(await _get_client().call(tool["name"], {})))
-        for item in items:
-            if _title_of(item).strip().lower() == name.strip().lower():
-                found = _id_of(item, ["id", "projectId", "listId"])
-                if found:
-                    db.kv_set("ticktick_project_id", found)
-                    return found
+        for project in await projects():
+            if project["name"].strip().lower() == name.strip().lower():
+                db.kv_set("ticktick_project_id", project["id"])
+                return project["id"]
     except Exception as exc:
         log.warning("TickTick MCP: список проектов не получен: %s", exc)
     return ""
@@ -244,7 +341,7 @@ async def create(title: str, due_iso: str = "") -> dict:
         if result.get("isError"):
             log.warning("TickTick MCP: создание вернуло ошибку: %s", extract_text(result))
             return {}
-        created = _as_items(extract_json(result))
+        created = _as_items(extract_json(result), prefer="task")
         if created:
             return {"id": _id_of(created[0], TASK_ID_KEYS),
                     "project_id": _id_of(created[0], PROJECT_KEYS)}
@@ -259,8 +356,9 @@ async def complete(project_id: str, task_id: str) -> bool:
         return False
     try:
         tools = await tool_list()
-        tool = _pick(tools, ["task"], ["complete", "finish", "done"]) \
-            or _pick(tools, ["task"], ["update"])
+        tool = _pick(tools, ["task"], ["complete", "finish", "done"],
+                     avoid=["undone", "uncompleted", "incomplete", "get", "list"]) \
+            or _pick(tools, ["task"], ["update"], avoid=["undone"])
         if not tool:
             return False
         props = _properties(tool)
