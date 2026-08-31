@@ -68,10 +68,40 @@ ACTION_TOOLS = [
         },
     },
     {
+        "name": "complete_tasks",
+        "description": (
+            "Отметить задачи выполненными: закрыть их в TickTick и в плане дня. "
+            "Вызывай на «отметь X как сделанное», «закрой задачу X», "
+            "«я сделал X и Y», «первую и третью выполнил». "
+            "Названия бери из списка дел на сегодня, который дан тебе ниже; "
+            "если человек назвал номера — подставь соответствующие названия."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "titles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Названия задач, которые нужно закрыть",
+                }
+            },
+            "required": ["titles"],
+        },
+    },
+    {
         "name": "list_tasks",
         "description": (
             "Показать незакрытые задачи из TickTick. Вызывай на "
             "«что у меня в задачах», «покажи тикток», «что висит»."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "tasks_overview",
+        "description": (
+            "Полный разбор задач: сколько в каком списке, что просрочено, "
+            "как распределено по папкам. Вызывай на «покажи задачи по проектам», "
+            "«что у меня по спискам», «разбери задачи», «что просрочено»."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -130,6 +160,36 @@ PERSONA = """Ты — личный ассистент. Отвечаешь по-�
 PLAIN = """Ты — ассистент. Отвечаешь по-русски, кратко и по делу."""
 
 
+def _integrations_note() -> str:
+    """Что подключено — чтобы модель не выдумывала, будто доступа нет."""
+    from app.integrations import gmail, tasks
+
+    rows = [
+        ("почта Gmail", gmail.connected()),
+        ("задачи TickTick", tasks.connected()),
+        ("календарь Apple", bool(config.CALENDAR_ENABLED)),
+    ]
+    lines = [f"- {name}: {'подключено' if ok else 'не подключено'}"
+             for name, ok in rows]
+    return (
+        "\n\nТвои подключения (это факт, не додумывай обратное):\n"
+        + "\n".join(lines)
+        + "\nЕсли что-то подключено — ты можешь этим пользоваться через свои "
+          "инструменты. Никогда не говори, что доступа нет, если выше указано "
+          "«подключено»."
+    )
+
+
+def _today_tasks_note() -> str:
+    """Текущий план дня — чтобы «отметь вторую» работало."""
+    items = [i for i in db.get_plan(date.today().isoformat())
+             if i["kind"] != "event" and i["status"] in ("open", "partial")]
+    if not items:
+        return ""
+    listing = "\n".join(f"{n}. {i['title']}" for n, i in enumerate(items, 1))
+    return f"\n\nНезакрытые дела на сегодня:\n{listing}"
+
+
 def system_prompt() -> str:
     tone = db.kv_get("tone", "jarvis")
     base = PERSONA if tone == "jarvis" else PLAIN
@@ -137,6 +197,8 @@ def system_prompt() -> str:
     if known:
         base += "\n\nЧто ты знаешь о владельце:\n" + "\n".join(f"- {f}" for f in known)
     base += f"\n\nСегодня {date.today().isoformat()}, таймзона {config.TZ_NAME}."
+    base += _integrations_note()
+    base += _today_tasks_note()
     base += "\n" + ROUTING_RULES
     return base
 

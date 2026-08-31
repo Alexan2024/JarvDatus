@@ -1,4 +1,5 @@
 """Телеграм-бот: свободная речь, кнопки, команды — три входа к одним действиям."""
+import difflib
 import html
 import time
 from datetime import date, datetime
@@ -151,6 +152,113 @@ async def act_add_task(message: Message, title: str = "") -> None:
     await reply_block(message, render.note(f"{mark}: {render.cut(title, 20)}"))
 
 
+def _norm(text: str) -> list[str]:
+    lowered = str(text).lower().replace("ё", "е").replace("й", "и")
+    cleaned = "".join(c if c.isalnum() else " " for c in lowered)
+    return [w for w in cleaned.split() if len(w) > 2]
+
+
+def _similar(a: str, b: str) -> float:
+    """Сходство названий: сначала по словам, потом по буквам."""
+    wa, wb = _norm(a), _norm(b)
+    if not wa or not wb:
+        return 0.0
+    sa, sb = " ".join(wa), " ".join(wb)
+    if sa == sb or sa in sb or sb in sa:
+        return 0.95
+
+    # общее значимое слово (с поправкой на окончания): «отчёт» ≈ «отчёта»
+    hits = 0
+    for x in wa:
+        for y in wb:
+            if x == y or (len(x) >= 4 and len(y) >= 4
+                          and (x.startswith(y[:4]) or y.startswith(x[:4]))):
+                hits += 1
+                break
+    if hits:
+        overlap = hits / min(len(wa), len(wb))
+        if overlap >= 0.5:
+            return 0.75 + 0.2 * overlap
+
+    return difflib.SequenceMatcher(None, sa, sb).ratio() * 0.7
+
+
+async def _candidates() -> list[dict]:
+    """Незакрытые дела: из плана дня и напрямую из TickTick."""
+    out = []
+    for item in db.get_plan(planning.today_key()):
+        if item["kind"] == "event" or item["status"] not in ("open", "partial"):
+            continue
+        out.append({
+            "title": item["title"], "plan_id": item["id"],
+            "tt_id": item.get("ticktick_id", ""),
+            "tt_project": item.get("ticktick_project", ""),
+        })
+    if tasks.connected():
+        seen = {c["title"].strip().lower() for c in out}
+        try:
+            for t in await tasks.open_tasks():
+                if t["title"].strip().lower() in seen:
+                    continue
+                out.append({"title": t["title"], "plan_id": None,
+                            "tt_id": t["id"], "tt_project": t["project_id"]})
+        except Exception:
+            pass
+    return out
+
+
+async def act_complete_tasks(message: Message, titles=None) -> None:
+    wanted = [str(t) for t in (titles or []) if str(t).strip()]
+    if not wanted:
+        return await message.answer("Что именно отметить, сэр?")
+
+    pool = await _candidates()
+    if not pool:
+        return await message.answer("Не вижу незакрытых дел, сэр.")
+
+    closed, in_ticktick, missed = [], 0, []
+    used = set()
+    for want in wanted:
+        best, score = None, 0.0
+        for i, cand in enumerate(pool):
+            if i in used:
+                continue
+            value = _similar(want, cand["title"])
+            if value > score:
+                best, score = i, value
+        if best is None or score < 0.7:
+            missed.append(want)
+            continue
+        used.add(best)
+        cand = pool[best]
+        if cand["plan_id"]:
+            db.set_item_status(cand["plan_id"], "done", "")
+        if cand["tt_id"] and tasks.connected():
+            try:
+                if await tasks.complete(cand["tt_project"], cand["tt_id"]):
+                    in_ticktick += 1
+            except Exception:
+                pass
+        closed.append(cand["title"])
+
+    if not closed:
+        return await message.answer(
+            "Не нашёл таких дел: " + ", ".join(render.cut(m, 20) for m in missed)
+        )
+
+    body = [render.cut(f"✓ {t}", render.W - 2) for t in closed]
+    footer = []
+    done, total = db.day_score(planning.today_key())
+    if total:
+        footer.append(render.row("день", f"{render.bar(done, total)}  {done}/{total}"))
+    if in_ticktick:
+        footer.append(f"✓ закрыто в TickTick: {in_ticktick}")
+    if missed:
+        footer.append("не найдено: " + render.cut(", ".join(missed), 14))
+    sections = [body] + ([footer] if footer else [])
+    await reply_block(message, render.box("ЗАКРЫТО", sections))
+
+
 async def act_list_tasks(message: Message) -> None:
     if not tasks.connected():
         return await message.answer("Задачи не подключены.")
@@ -159,6 +267,30 @@ async def act_list_tasks(message: Message) -> None:
         return await message.answer("Открытых задач нет, сэр.")
     body = [render.cut(f"□ {i['title']}", render.W - 2) for i in items[:12]]
     await reply_block(message, render.box("ЗАДАЧИ", [body]))
+
+
+async def act_tasks_overview(message: Message) -> None:
+    if not tasks.connected():
+        return await message.answer("Задачи не подключены.")
+    from app import brief as brief_module
+    from app import tasks_view
+
+    items = await tasks.open_tasks(limit=60)
+    if not items:
+        return await message.answer("Открытых задач нет, сэр.")
+    analysis = tasks_view.analyse(items)
+    await reply_block(message, render.tasks_overview(
+        analysis, brief_module.by_project(items)))
+
+    urgent = tasks_view.urgent(analysis, limit=6)
+    if urgent:
+        body = []
+        for row in urgent:
+            if row["note"]:
+                body.append(render.row(f"{row['mark']} {row['title']}", row["note"]))
+            else:
+                body.append(render.cut(f"{row['mark']} {row['title']}", render.W - 2))
+        await reply_block(message, render.box("ТРЕБУЕТ ВНИМАНИЯ", [body]))
 
 
 async def act_remember(message: Message, fact: str = "") -> None:
@@ -178,6 +310,8 @@ ACTIONS = {
     "run_diagnostics": lambda m, a: act_diagnostics(m),
     "add_task": lambda m, a: act_add_task(m, a.get("title", "")),
     "list_tasks": lambda m, a: act_list_tasks(m),
+    "tasks_overview": lambda m, a: act_tasks_overview(m),
+    "complete_tasks": lambda m, a: act_complete_tasks(m, a.get("titles", [])),
     "remember_fact": lambda m, a: act_remember(m, a.get("fact", "")),
 }
 
@@ -269,10 +403,26 @@ async def cmd_tasks(message: Message):
             lines += ["  · " + p["name"] for p in projects[:10]]
         except Exception as exc:
             lines.append(f"ошибка списка: {exc}")
-    open_items = await tasks.open_tasks()
+    open_items = await tasks.open_tasks(limit=60)
     lines.append("")
     lines.append(f"открытых задач: {len(open_items)}")
-    lines += ["□ " + i["title"][:30] for i in open_items[:10]]
+    for i in open_items[:10]:
+        extra = []
+        if i.get("due"):
+            extra.append(f"срок {i['due']}")
+        if i.get("priority") is not None:
+            extra.append(f"приоритет {i['priority']}")
+        if i.get("group"):
+            extra.append(f"папка {i['group']}")
+        tail = ("  [" + ", ".join(extra) + "]") if extra else ""
+        lines.append(f"□ {i['title'][:26]}{tail}")
+
+    raw = db.kv_get("ticktick_raw_task")
+    if raw:
+        import json
+        lines.append("")
+        lines.append("сырые поля одной задачи (для настройки):")
+        lines.append(json.dumps(raw, ensure_ascii=False)[:900])
     await message.answer("\n".join(lines))
 
 

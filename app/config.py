@@ -46,6 +46,18 @@ TICKTICK_TOKEN = os.getenv("TICKTICK_TOKEN", "").strip()
 TICKTICK_CLIENT_ID = os.getenv("TICKTICK_CLIENT_ID", "").strip()
 TICKTICK_CLIENT_SECRET = os.getenv("TICKTICK_CLIENT_SECRET", "").strip()
 TICKTICK_PROJECT_NAME = os.getenv("TICKTICK_PROJECT_NAME", "Jarvis").strip()
+TASK_MAX_PROJECTS = _int("TASK_MAX_PROJECTS", 12)
+TASK_SKIP_PROJECTS = [p.strip().lower()
+                      for p in os.getenv("TASK_SKIP_PROJECTS", "").split(",") if p.strip()]
+
+# Запасное деление на группы, если папок в TickTick нет:
+# TASK_GROUPS=Работа:рабочее, Клиенты:рабочее, Дом:личное
+TASK_GROUPS = {}
+for _pair in os.getenv("TASK_GROUPS", "").split(","):
+    if ":" in _pair:
+        _name, _group = _pair.split(":", 1)
+        if _name.strip() and _group.strip():
+            TASK_GROUPS[_name.strip().lower()] = _group.strip()
 
 APPLE_ID = os.getenv("APPLE_ID", "").strip()
 APPLE_APP_PASSWORD = os.getenv("APPLE_APP_PASSWORD", "").strip()

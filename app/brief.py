@@ -2,7 +2,7 @@
 import asyncio
 from datetime import date
 
-from app import claude_client, db, render
+from app import claude_client, db, render, tasks_view
 from app.integrations import calendar, gmail, news, tasks
 
 MAIL_SYSTEM = """Ты разбираешь почту. Для каждого письма дай ОДНУ строку не длиннее
@@ -56,7 +56,7 @@ async def gather() -> dict:
     mail_t = asyncio.create_task(_safe(gmail.recent() if gmail.connected() else _none()))
     news_t = asyncio.create_task(_safe(news.headlines()))
     tasks_t = asyncio.create_task(
-        _safe(tasks.open_tasks() if tasks.connected() else _none())
+        _safe(tasks.open_tasks(limit=60) if tasks.connected() else _none())
     )
 
     weather = await weather_t
@@ -69,13 +69,20 @@ async def gather() -> dict:
         _safe(summarize_mail(letters)), _safe(summarize_news(raw_news))
     )
 
+    analysis = tasks_view.analyse(tt_tasks) if tt_tasks else None
+
     carry = db.carryover(today.isoformat())
     seen = {c["title"].strip().lower() for c in carry}
+    # в план дня предлагаем срочные задачи из TickTick, а не всё подряд
+    urgent_titles = {r["title"].strip().lower()
+                     for r in tasks_view.urgent(analysis, limit=6)} if analysis else set()
     for t in tt_tasks:
-        if t["title"].strip().lower() not in seen:
-            carry.append({"title": t["title"], "ticktick_id": t["id"],
-                          "ticktick_project": t["project_id"], "kind": "carry"})
-            seen.add(t["title"].strip().lower())
+        key = t["title"].strip().lower()
+        if key in seen or key not in urgent_titles:
+            continue
+        carry.append({"title": t["title"], "ticktick_id": t["id"],
+                      "ticktick_project": t["project_id"], "kind": "carry"})
+        seen.add(key)
 
     return {
         "date": today,
@@ -84,6 +91,8 @@ async def gather() -> dict:
         "mail": mail or [],
         "news": headlines or [],
         "carry": carry[:6],
+        "tasks": analysis,
+        "raw_tasks": tt_tasks,
     }
 
 
@@ -106,5 +115,24 @@ async def _safe(coro):
 def render_brief(data: dict) -> str:
     return render.morning_brief(
         data["date"], data["weather"], data["events"],
-        data["mail"], data["news"], data["carry"],
+        data["mail"], data["news"], data["carry"], data.get("tasks"),
     )
+
+
+def by_project(items: list[dict]) -> list[tuple[str, int, int]]:
+    """Сводка по спискам: (название, всего, просрочено)."""
+    from datetime import datetime
+
+    from app import config
+
+    today = datetime.now(config.TZ).date()
+    counts: dict[str, list[int]] = {}
+    for item in items:
+        name = (item.get("project") or "без списка").strip()
+        row = counts.setdefault(name, [0, 0])
+        row[0] += 1
+        due = tasks_view.parse_due(item.get("due"))
+        if due and due < today:
+            row[1] += 1
+    return sorted(((n, c[0], c[1]) for n, c in counts.items()),
+                  key=lambda r: (-r[2], -r[1]))

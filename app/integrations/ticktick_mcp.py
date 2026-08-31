@@ -157,6 +157,42 @@ def _id_of(item: dict, keys: list[str]) -> str:
     return ""
 
 
+DUE_KEYS = ("dueDate", "due_date", "due", "dueDateTime", "deadline", "date")
+PRIORITY_KEYS = ("priority", "prio", "importance")
+
+
+def _due_of(item: dict) -> str:
+    for key in DUE_KEYS:
+        for actual in item:
+            if actual.lower().replace("_", "") == key.lower().replace("_", ""):
+                value = item[actual]
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, dict):
+                    for inner in ("date", "dateTime", "value"):
+                        if isinstance(value.get(inner), str):
+                            return value[inner]
+    return ""
+
+
+def _priority_of(item: dict):
+    for key in PRIORITY_KEYS:
+        for actual in item:
+            if actual.lower() == key.lower():
+                value = item[actual]
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float)):
+                    return int(value)
+                if isinstance(value, str):
+                    text = value.strip().lower()
+                    if text.isdigit():
+                        return int(text)
+                    return {"none": 0, "low": 1, "medium": 3, "normal": 3,
+                            "high": 5, "urgent": 5}.get(text)
+    return None
+
+
 def _is_done(item: dict) -> bool:
     status = item.get("status")
     if isinstance(status, (int, float)):
@@ -191,8 +227,40 @@ def _tasks_tool(tools: list[dict]) -> dict | None:
                  avoid=avoid)
 
 
+GROUP_KEYS = ["groupId", "group_id", "folderId", "folder_id", "parentId"]
+_groups_cache: dict[str, str] = {}
+_groups_at = 0.0
 _projects_cache: list[dict] = []
 _projects_at = 0.0
+
+
+async def groups(force: bool = False) -> dict[str, str]:
+    """Папки TickTick: {id папки: название}. Пусто, если сервер их не отдаёт."""
+    global _groups_cache, _groups_at
+    if _groups_cache and not force and time.time() - _groups_at < 3600:
+        return _groups_cache
+    try:
+        tools = await tool_list()
+        tool = _pick(tools, ["group"], ["list", "get", "all", "fetch", "query"],
+                     avoid=["create", "add", "update", "delete", "task", "member"]) \
+            or _pick(tools, ["folder"], ["list", "get", "all", "fetch", "query"],
+                     avoid=["create", "add", "update", "delete", "task"])
+        if not tool:
+            return {}
+        items = _as_items(extract_json(await _get_client().call(tool["name"], {})),
+                          prefer="group")
+        found = {}
+        for item in items:
+            gid = _id_of(item, ["id", "groupId", "folderId"])
+            name = _title_of(item)
+            if gid and name:
+                found[gid] = name
+        if found:
+            _groups_cache, _groups_at = found, time.time()
+        return found
+    except Exception as exc:
+        log.warning("TickTick MCP: папки не получены: %s", exc)
+        return {}
 
 
 async def projects(force: bool = False) -> list[dict]:
@@ -205,11 +273,18 @@ async def projects(force: bool = False) -> list[dict]:
         return []
     items = _as_items(extract_json(await _get_client().call(tool["name"], {})),
                       prefer="project")
+    folders = await groups()
     out = []
     for item in items:
         pid = _id_of(item, ["id", "projectId", "listId"])
-        if pid:
-            out.append({"id": pid, "name": _title_of(item)})
+        if not pid:
+            continue
+        name = _title_of(item)
+        gid = _id_of(item, GROUP_KEYS)
+        group = folders.get(gid, "") if gid else ""
+        if not group:
+            group = config.TASK_GROUPS.get(name.strip().lower(), "")
+        out.append({"id": pid, "name": name, "group_id": gid, "group": group})
     if out:
         _projects_cache, _projects_at = out, time.time()
     return out
@@ -233,11 +308,14 @@ async def open_tasks(limit: int = 15) -> list[dict]:
             if not found:
                 log.warning("TickTick MCP: список проектов пуст")
                 return []
+            found = [p for p in found
+                     if p["name"].strip().lower() not in config.TASK_SKIP_PROJECTS]
             preferred = config.TICKTICK_PROJECT_NAME.strip().lower()
             found.sort(key=lambda p: p["name"].strip().lower() != preferred)
-            targets = found[:8]
+            targets = found[:max(1, config.TASK_MAX_PROJECTS)]
 
         out: list[dict] = []
+        _sample_saved = False
         for target in targets:
             if len(out) >= limit:
                 break
@@ -261,6 +339,9 @@ async def open_tasks(limit: int = 15) -> list[dict]:
             if not items:
                 items = await _rescue(extract_text(result))
             for item in items:
+                if not _sample_saved and item:
+                    db.kv_set("ticktick_raw_task", item)
+                    _sample_saved = True
                 if _is_done(item):
                     continue
                 title = _title_of(item)
@@ -269,8 +350,11 @@ async def open_tasks(limit: int = 15) -> list[dict]:
                 out.append({
                     "id": _id_of(item, TASK_ID_KEYS),
                     "project_id": _id_of(item, PROJECT_KEYS) or target["id"],
+                    "project": target.get("name", ""),
+                    "group": target.get("group", ""),
                     "title": title,
-                    "due": str(item.get("dueDate") or item.get("due_date") or ""),
+                    "due": _due_of(item),
+                    "priority": _priority_of(item),
                 })
         return out[:limit]
     except Exception as exc:

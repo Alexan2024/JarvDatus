@@ -98,6 +98,13 @@ def spark(values: list[float]) -> str:
     return "".join(BARS[min(7, int((v - lo) / span * 7))] for v in vals)
 
 
+def row_pair(left: str, right: str, width: int = W - 2) -> str:
+    """Пара «текст — значение» для открытого стиля (без боковых рамок)."""
+    right = cut(right, 8)
+    left = fit(left, max(1, width - len(right) - 1))
+    return left + " " * max(1, width - len(left) - len(right)) + right
+
+
 def row(left: str, right: str = "") -> str:
     """Строка с прижатой вправо колонкой."""
     inner = W - 2
@@ -109,7 +116,7 @@ def row(left: str, right: str = "") -> str:
 
 # ---------- утренний бриф (открытый стиль) ----------
 
-def morning_brief(d: date, weather, events, mail, news, carry) -> str:
+def morning_brief(d: date, weather, events, mail, news, carry, tasks=None) -> str:
     line = "─" * W
     out = [f"{ru_date(d)} · {datetime.now().strftime('%H:%M')}", line]
 
@@ -141,6 +148,23 @@ def morning_brief(d: date, weather, events, mail, news, carry) -> str:
         out.append("НОВОСТИ")
         for n in news[:5]:
             out.append("  " + fit(f"·  {cut(n, 20)}", W - 2))
+        out.append("")
+
+    if tasks and tasks.get("total"):
+        out.append(f"ЗАДАЧИ · {tasks['total']} открыто")
+        from app import tasks_view
+        shown = tasks_view.urgent(tasks)
+        for row in shown:
+            if row["note"]:
+                body = row_pair(f"{row['mark']}  {cut(row['title'], 17)}", row["note"])
+            else:
+                body = fit(f"{row['mark']}  {cut(row['title'], 20)}", W - 2)
+            out.append("  " + body)
+        hidden = tasks_view.hidden_count(tasks, shown)
+        if hidden:
+            out.append("  " + fit(f"…ещё {hidden} на очереди", W - 2))
+        for line_counter in tasks_view.counters(tasks):
+            out.append("  " + fit(line_counter, W - 2))
         out.append("")
 
     if carry:
@@ -222,6 +246,38 @@ def debrief_result(d: date, items: list[dict], done: int, total: int, days: int,
     if closed:
         sections.append([f"✓ закрыто в TickTick: {closed}"])
     return box(f"ИТОГ · {ru_date(d)}", sections)
+
+
+# ---------- задачи по спискам ----------
+
+def tasks_overview(analysis: dict, by_project: list[tuple[str, int, int]]) -> str:
+    """by_project — (название, всего, просрочено)."""
+    body = []
+    for name, total, late in by_project[:10]:
+        right = f"{total}" + (f"   ⚠{late}" if late else "")
+        body.append(row(name, right))
+    if not body:
+        body = ["Открытых задач нет"]
+
+    footer = []
+    if analysis.get("groups"):
+        for group, count in analysis["groups"][:4]:
+            footer.append(row(group, str(count)))
+    tail = []
+    if analysis.get("overdue"):
+        tail.append(f"просрочено: {len(analysis['overdue'])}")
+    if analysis.get("today"):
+        tail.append(f"на сегодня: {len(analysis['today'])}")
+    without = len(analysis.get("rest", [])) + len(analysis.get("high", []))
+    if without:
+        tail.append(f"без срока: {without}")
+
+    sections = [body]
+    if footer:
+        sections.append(footer)
+    if tail:
+        sections.append(tail)
+    return box(f"ЗАДАЧИ · {analysis.get('total', 0)}", sections)
 
 
 # ---------- статус ----------
