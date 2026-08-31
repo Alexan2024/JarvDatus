@@ -55,7 +55,7 @@ async def build_morning() -> tuple[str, str]:
         ],
     })
     question = render.note("Что сегодня, сэр? Пишите как есть — разберу.")
-    return brief.render_brief(data), question
+    return brief.render_html(data), question
 
 
 async def handle_plan_reply(text: str) -> str:
