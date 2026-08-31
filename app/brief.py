@@ -5,14 +5,17 @@ from datetime import date
 from app import claude_client, db, render, tasks_view
 from app.integrations import calendar, gmail, news, tasks
 
-MAIL_SYSTEM = """Ты разбираешь почту. Для каждого письма дай ОДНУ строку не длиннее
-40 символов в формате «Отправитель — суть». Пометь important=true, если письмо
-требует личного ответа или содержит срок/деньги. Рекламу и рассылки помечай
-important=false и суть пиши как «рассылка»."""
+MAIL_SYSTEM = """Ты разбираешь почту. Для каждого письма дай одну законченную
+фразу до 42 символов в формате «Отправитель — суть». Обрывать на полуслове
+нельзя: лучше выбрать формулировку короче, чем не поместиться.
+Пометь important=true, если письмо требует личного ответа или содержит
+срок/деньги. Рекламу и рассылки помечай important=false, суть — «рассылка»."""
 
-NEWS_SYSTEM = """Ты — редактор новостной ленты. Выбери 3-5 самых значимых заголовков
-и перепиши каждый своими словами в одну строку не длиннее 32 символов.
-Без кавычек, без источников."""
+NEWS_SYSTEM = """Ты — редактор новостной ленты. Выбери 3-5 самых значимых новостей
+и перепиши заголовок каждой своими словами одним законченным предложением
+до 90 символов — так, чтобы суть была понятна без перехода по ссылке.
+Без кавычек, без названий источников, без обрыва на полуслове.
+Обязательно сохраняй поле i — номер исходного заголовка."""
 
 
 async def summarize_mail(letters: list[dict]) -> list[dict]:
@@ -34,18 +37,33 @@ async def summarize_mail(letters: list[dict]) -> list[dict]:
              "important": m.get("unread", False)} for m in letters[:5]]
 
 
-async def summarize_news(items: list[dict]) -> list[str]:
+async def summarize_news(items: list[dict]) -> list[dict]:
+    """Возвращает [{"title": переписанный заголовок, "link": исходная ссылка}]."""
     if not items:
         return []
-    listing = "\n".join(f"- {n['title']}" for n in items)
+    listing = "\n".join(f"{i+1}. {n['title']}" for i, n in enumerate(items))
     result = await claude_client.ask_json(
-        f"Заголовки:\n{listing}\n\nВерни JSON: " '{"items":["...","..."]}',
+        f"Заголовки:\n{listing}\n\nВерни JSON: "
+        '{"items":[{"i":1,"line":"законченное предложение"}]}',
         system=NEWS_SYSTEM,
         fallback=None,
     )
+    out = []
     if isinstance(result, dict) and isinstance(result.get("items"), list):
-        return [str(x) for x in result["items"]][:5]
-    return [render.cut(n["title"], 32) for n in items[:4]]
+        for row in result["items"][:5]:
+            if not isinstance(row, dict) or not row.get("line"):
+                continue
+            link = ""
+            try:
+                index = int(row.get("i", 0)) - 1
+                if 0 <= index < len(items):
+                    link = items[index].get("link", "")
+            except (TypeError, ValueError):
+                pass
+            out.append({"title": str(row["line"]).strip(), "link": link})
+    if out:
+        return out
+    return [{"title": n["title"], "link": n.get("link", "")} for n in items[:4]]
 
 
 async def gather() -> dict:
@@ -113,10 +131,37 @@ async def _safe(coro):
 
 
 def render_brief(data: dict) -> str:
+    """Только моноширинный блок, без новостей."""
     return render.morning_brief(
         data["date"], data["weather"], data["events"],
-        data["mail"], data["news"], data["carry"], data.get("tasks"),
+        data["mail"], data["carry"], data.get("tasks"),
     )
+
+
+def render_html(data: dict) -> str:
+    """Блок в рамке + новости под ним отдельными кликабельными строками.
+
+    Ссылки внутри <pre> Telegram не делает кликабельными, поэтому новости
+    живут под блоком обычным текстом.
+    """
+    import html as html_mod
+
+    parts = ["<pre>" + html_mod.escape(render_brief(data)) + "</pre>"]
+    news = data.get("news") or []
+    if news:
+        lines = ["", "<b>НОВОСТИ</b>"]
+        for item in news[:5]:
+            title = html_mod.escape(str(item.get("title", "")).strip())
+            if not title:
+                continue
+            link = str(item.get("link", "")).strip()
+            if link.startswith("http"):
+                lines.append(f'• <a href="{html_mod.escape(link, quote=True)}">{title}</a>')
+            else:
+                lines.append(f"• {title}")
+        if len(lines) > 2:
+            parts.append("\n".join(lines))
+    return "\n".join(parts)
 
 
 def by_project(items: list[dict]) -> list[tuple[str, int, int]]:
