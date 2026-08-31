@@ -114,9 +114,32 @@ def row(left: str, right: str = "") -> str:
     return left + " " * max(1, gap) + right
 
 
+def flow_note(mark: str, text: str, note: str, width: int = W) -> list[str]:
+    """Как flow, но со значением справа: оно прижимается к концу последней строки."""
+    lines = flow(mark, text, width)
+    if not note:
+        return lines
+    tail = lines[-1]
+    if len(tail) + 1 + len(note) <= width:
+        lines[-1] = tail + " " * (width - len(tail) - len(note)) + note
+    else:
+        indent = len(f"  {mark}  ") if mark else 2
+        lines.append(" " * indent + note)
+    return lines
+
+
+def flow(mark: str, text: str, width: int = W) -> list[str]:
+    """Строка с маркером и переносом: продолжение выравнивается под текст."""
+    head = f"  {mark}  " if mark else "  "
+    cont = " " * len(head)
+    lines = wrap(text, max(8, width - len(head)))
+    return [head + lines[0]] + [cont + line for line in lines[1:]]
+
+
 # ---------- утренний бриф (открытый стиль) ----------
 
-def morning_brief(d: date, weather, events, mail, news, carry, tasks=None) -> str:
+def morning_brief(d: date, weather, events, mail, carry, tasks=None) -> str:
+    """Новости сюда не входят: они уходят под блок отдельными ссылками."""
     line = "─" * W
     out = [f"{ru_date(d)} · {datetime.now().strftime('%H:%M')}", line]
 
@@ -130,7 +153,11 @@ def morning_brief(d: date, weather, events, mail, news, carry, tasks=None) -> st
     if events:
         out.append("КАЛЕНДАРЬ")
         for e in events[:6]:
-            out.append("  " + fit(f"{e['time']}  {cut(e['title'], 17)}", W - 2))
+            head = f"  {e['time']}  "
+            cont = " " * len(head)
+            lines = wrap(e["title"], W - len(head))
+            out.append(head + lines[0])
+            out += [cont + line for line in lines[1:2]]
         if weather is not None and events:
             gap = free_gap(events)
             if gap:
@@ -141,13 +168,7 @@ def morning_brief(d: date, weather, events, mail, news, carry, tasks=None) -> st
         out.append(f"ПОЧТА · {len(mail)}")
         for m in mail[:5]:
             mark = "!" if m.get("important") else "·"
-            out.append("  " + fit(f"{mark}  {cut(m['line'], 19)}", W - 2))
-        out.append("")
-
-    if news:
-        out.append("НОВОСТИ")
-        for n in news[:5]:
-            out.append("  " + fit(f"·  {cut(n, 20)}", W - 2))
+            out += flow(mark, m["line"])
         out.append("")
 
     if tasks and tasks.get("total"):
@@ -155,11 +176,7 @@ def morning_brief(d: date, weather, events, mail, news, carry, tasks=None) -> st
         from app import tasks_view
         shown = tasks_view.urgent(tasks)
         for row in shown:
-            if row["note"]:
-                body = row_pair(f"{row['mark']}  {cut(row['title'], 17)}", row["note"])
-            else:
-                body = fit(f"{row['mark']}  {cut(row['title'], 20)}", W - 2)
-            out.append("  " + body)
+            out += flow_note(row["mark"], row["title"], row["note"])
         hidden = tasks_view.hidden_count(tasks, shown)
         if hidden:
             out.append("  " + fit(f"…ещё {hidden} на очереди", W - 2))
@@ -170,7 +187,7 @@ def morning_brief(d: date, weather, events, mail, news, carry, tasks=None) -> st
     if carry:
         out.append("СО ВЧЕРА")
         for c in carry[:5]:
-            out.append("  " + fit(f"←  {cut(c['title'], 20)}", W - 2))
+            out += flow("←", c["title"])
         out.append("")
 
     while out and out[-1] == "":
