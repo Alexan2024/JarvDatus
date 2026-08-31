@@ -38,6 +38,11 @@ async def send_block(text: str) -> None:
     await bot.send_message(config.OWNER_ID, mono(text), parse_mode=ParseMode.HTML)
 
 
+async def send_html(html_text: str) -> None:
+    await bot.send_message(config.OWNER_ID, html_text, parse_mode=ParseMode.HTML,
+                           disable_web_page_preview=True)
+
+
 async def send_text(text: str) -> None:
     await bot.send_message(config.OWNER_ID, html.escape(text),
                            parse_mode=ParseMode.HTML)
@@ -45,6 +50,12 @@ async def send_text(text: str) -> None:
 
 async def reply_block(message: Message, text: str) -> None:
     await message.answer(mono(text), parse_mode=ParseMode.HTML)
+
+
+async def reply_html(message: Message, html_text: str) -> None:
+    """Готовая разметка: блок в <pre> плюс кликабельные ссылки под ним."""
+    await message.answer(html_text, parse_mode=ParseMode.HTML,
+                         disable_web_page_preview=True)
 
 
 def mine(message: Message) -> bool:
@@ -56,8 +67,8 @@ def mine(message: Message) -> bool:
 
 async def act_brief(message: Message) -> None:
     await message.answer("Собираю…")
-    text, _ = await planning.build_morning()
-    await reply_block(message, text)
+    html_text, _ = await planning.build_morning()
+    await reply_html(message, html_text)
 
 
 async def act_plan_day(message: Message) -> None:
