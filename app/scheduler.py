@@ -13,8 +13,8 @@ log = logging.getLogger(__name__)
 
 async def morning_job() -> None:
     try:
-        brief_text, question = await planning.build_morning()
-        await bot_module.send_block(brief_text)
+        brief_html, question = await planning.build_morning()
+        await bot_module.send_html(brief_html)
         planning.set_mode("await_plan")
         await bot_module.send_block(question)
     except Exception as exc:
